@@ -1,386 +1,894 @@
 package com.xhsmonitor
 
-import android.Manifest
-import android.app.AlertDialog
+import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.BroadcastReceiver
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.graphics.Path
+import android.graphics.Rect
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.provider.Settings
-import android.view.View
-import android.widget.Button
-import android.widget.CheckBox
-import android.widget.EditText
-import android.widget.ScrollView
-import android.widget.TextView
-import android.widget.Toast
-import androidx.appcompat.app.AppCompatActivity
-import androidx.core.app.ActivityCompat
+import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
-import androidx.recyclerview.widget.LinearLayoutManager
-import androidx.recyclerview.widget.RecyclerView
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import kotlin.random.Random
 
-class MainActivity : AppCompatActivity() {
+/**
+ * 只读监控服务：搜索关键词 -> 打开命中的笔记 -> 读取评论 -> 汇总。
+ * 不发帖、不评论、不私信、不绕过任何验证。
+ */
+class MonitorService : AccessibilityService() {
 
-    private lateinit var db: DbHelper
-    private lateinit var statusText: TextView
-    private val dumpHandler = Handler(Looper.getMainLooper())
-    private lateinit var keywordAdapter: KeywordAdapter
-    private lateinit var commentAdapter: CommentAdapter
-    private val keywordItems = mutableListOf<String>()
-    private val commentItems = mutableListOf<CommentRecord>()
+    companion object {
+        const val XHS_PACKAGE = "com.xingin.xhs"
+        const val ACTION_START = "com.xhsmonitor.action.START"
+        const val ACTION_STOP = "com.xhsmonitor.action.STOP"
+        const val ACTION_DUMP = "com.xhsmonitor.action.DUMP"
+        const val ACTION_GENERATE = "com.xhsmonitor.action.GENERATE"
+        const val ACTION_RELOAD = "com.xhsmonitor.action.RELOAD"
+
+        const val BROADCAST_STATUS = "com.xhsmonitor.status"
+        const val BROADCAST_NEW_COMMENT = "com.xhsmonitor.new_comment"
+        const val BROADCAST_DUMP = "com.xhsmonitor.dump"
+        const val BROADCAST_REPORT = "com.xhsmonitor.report"
+    }
+
+    private enum class State {
+        LAUNCH, FIND_SEARCH, INPUT_KEYWORD, TYPING_KEYWORD, SUBMIT_SEARCH,
+        COLLECT_NOTES, READ_COMMENTS
+    }
+
+    private data class Card(val node: AccessibilityNodeInfo, val key: String, val title: String)
+
+    private val handler = Handler(Looper.getMainLooper())
+    private val db by lazy { DbHelper(this) }
+
+    private var running = false
+    private var keywords = mutableListOf<String>()
+    private var keywordIndex = 0
+    private var notesThisRound = 0
+    private var scrollEmptyCount = 0
+    private var commentScrollCount = 0
+    private var state = State.LAUNCH
+    private var visited = mutableSetOf<String>()
+    private var currentNoteTitle = ""
+
+    private var selectors = Selectors()
+    private var intervalMs = 5000L
+    private var maxNotes = 12
+    private var reportIntervalMs = 3_600_000L
+    @Volatile private var lastReportTs = System.currentTimeMillis()
+
+    // 类人化节奏相关状态
+    private var humanMode = true
+    private var typingSteps: List<HumanBehavior.TypingStep> = emptyList()
+    private var typingIndex = 0
+    private var typingRetryCount = 0
+    private var nextBreakAt = 0L
+    private var restUntil = 0L
+    private var resting = false
+    private var targetCommentScrolls = 2
+    private var justReturnedFromNote = false
+    private var findSearchRetryCount = 0
+    private var inputRetryCount = 0
+
+    private val stepRunnable = Runnable { if (running) step() }
+    private val reportRunnable = object : Runnable {
+        override fun run() {
+            if (!running) return
+            Thread { generateReport() }.start()
+            handler.postDelayed(this, reportIntervalMs)
+        }
+    }
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
-                MonitorService.BROADCAST_STATUS -> {
-                    intent.getStringExtra("msg")?.let { statusText.text = "状态：$it" }
-                }
-                MonitorService.BROADCAST_NEW_COMMENT -> {
-                    loadComments()
-                    refreshStatus()
-                }
-                MonitorService.BROADCAST_REPORT -> refreshReports()
-                MonitorService.BROADCAST_DUMP -> {
-                    showDumpDialog(
-                        intent.getStringExtra("dump") ?: "",
-                        intent.getStringExtra("path") ?: ""
-                    )
-                }
+                ACTION_START -> startInternal()
+                ACTION_STOP -> stopInternal()
+                ACTION_DUMP -> dumpCurrentScreen()
+                ACTION_GENERATE -> generateReport()
+                ACTION_RELOAD -> reloadSettings()
             }
         }
     }
 
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
-        db = DbHelper(this)
-        statusText = findViewById(R.id.tv_status)
-
-        requestPermissionsIfNeeded()
-        setupTabs()
-        setupKeywords()
-        setupComments()
-        setupReports()
-
+    override fun onCreate() {
+        super.onCreate()
         val filter = IntentFilter()
-        filter.addAction(MonitorService.BROADCAST_STATUS)
-        filter.addAction(MonitorService.BROADCAST_NEW_COMMENT)
-        filter.addAction(MonitorService.BROADCAST_REPORT)
-        filter.addAction(MonitorService.BROADCAST_DUMP)
+        filter.addAction(ACTION_START)
+        filter.addAction(ACTION_STOP)
+        filter.addAction(ACTION_DUMP)
+        filter.addAction(ACTION_GENERATE)
+        filter.addAction(ACTION_RELOAD)
         LocalBroadcastManager.getInstance(this).registerReceiver(receiver, filter)
-
-        refreshStatus()
-    }
-
-    override fun onResume() {
-        super.onResume()
-        refreshStatus()
-        loadComments()
-        refreshReports()
+        reloadSettings()
+        startReportTimer()
     }
 
     override fun onDestroy() {
-        dumpHandler.removeCallbacksAndMessages(null)
         LocalBroadcastManager.getInstance(this).unregisterReceiver(receiver)
+        handler.removeCallbacks(stepRunnable)
+        handler.removeCallbacks(reportRunnable)
         super.onDestroy()
     }
 
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        val denied = grantResults.any { it != PackageManager.PERMISSION_GRANTED }
-        if (denied) {
-            toast("部分权限被拒绝：通知或旧版存储可能不可用，报告仍可在 App 内查看")
-        }
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        reloadSettings()
+        if (Config.isRunning(this)) startInternal()
     }
 
-    private fun toast(message: String) {
-        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        // 流程由定时器驱动，事件仅用于系统保持服务连接
     }
 
-    // ---------------- 权限 ----------------
-
-    private fun requestPermissionsIfNeeded() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
-            PackageManager.PERMISSION_GRANTED
-        ) {
-            ActivityCompat.requestPermissions(
-                this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 101
-            )
-        }
-        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) !=
-            PackageManager.PERMISSION_GRANTED
-        ) {
-            ActivityCompat.requestPermissions(
-                this, arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE), 102
-            )
-        }
+    override fun onInterrupt() {
+        // 系统打断时不做操作
     }
 
-    private fun isAccessibilityEnabled(): Boolean {
-        return try {
-            if (Settings.Secure.getInt(
-                    contentResolver, Settings.Secure.ACCESSIBILITY_ENABLED, 0
-                ) == 0
-            ) return false
-            val setting = Settings.Secure.getString(
-                contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
-            ) ?: return false
-            setting.split(':').any {
-                it.contains(packageName, ignoreCase = true) &&
-                        it.contains("MonitorService", ignoreCase = true)
-            }
-        } catch (e: Exception) {
-            false
+    // ---------------- 配置与生命周期 ----------------
+
+    private fun reloadSettings() {
+        val previousHumanMode = humanMode
+        selectors = Config.getSelectors(this)
+        intervalMs = Config.getInt(this, Config.KEY_INTERVAL, 5)
+            .coerceIn(3, 60).toLong() * 1000L
+        maxNotes = Config.getInt(this, Config.KEY_MAX_NOTES, 12).coerceIn(1, 60)
+        reportIntervalMs = Config.getInt(this, Config.KEY_REPORT_MIN, 60)
+            .coerceIn(5, 1440).toLong() * 60_000L
+        humanMode = Config.isHumanMode(this)
+        // 中途开启类人化时重置休息计时，避免立刻进入休息
+        if (!previousHumanMode && humanMode) {
+            nextBreakAt = System.currentTimeMillis() + HumanBehavior.breakAfterMs()
         }
+        if (running) startReportTimer()
     }
 
-    private fun openAccessibilitySettings() {
-        startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-        toast("在列表中找到「小红书评论监控」并打开")
+    private fun startReportTimer() {
+        handler.removeCallbacks(reportRunnable)
+        if (running) handler.postDelayed(reportRunnable, reportIntervalMs)
     }
 
-    // ---------------- 界面 ----------------
-
-    private fun setupTabs() {
-        findViewById<Button>(R.id.btn_tab_keywords).setOnClickListener { showTab(0) }
-        findViewById<Button>(R.id.btn_tab_comments).setOnClickListener { showTab(1) }
-        findViewById<Button>(R.id.btn_tab_reports).setOnClickListener { showTab(2) }
+    private fun startInternal() {
+        reloadSettings()
+        keywords = Config.getKeywords(this)
+        if (keywords.isEmpty()) {
+            postStatus("请先在「关键词」页添加关键词")
+            Config.setRunning(this, false)
+            return
+        }
+        running = true
+        Config.setRunning(this, true)
+        keywordIndex = 0
+        notesThisRound = 0
+        scrollEmptyCount = 0
+        commentScrollCount = 0
+        typingRetryCount = 0
+        justReturnedFromNote = false
+        findSearchRetryCount = 0
+        inputRetryCount = 0
+        visited.clear()
+        state = State.LAUNCH
+        lastReportTs = System.currentTimeMillis()
+        resting = false
+        restUntil = 0L
+        nextBreakAt = System.currentTimeMillis() + HumanBehavior.breakAfterMs()
+        startReportTimer()
+        db.addLog("监控启动：${keywords.joinToString(" / ")}")
+        postStatus("监控已启动")
+        schedule(400)
     }
 
-    private fun showTab(index: Int) {
-        findViewById<View>(R.id.view_keywords).visibility =
-            if (index == 0) View.VISIBLE else View.GONE
-        findViewById<View>(R.id.view_comments).visibility =
-            if (index == 1) View.VISIBLE else View.GONE
-        findViewById<View>(R.id.view_reports).visibility =
-            if (index == 2) View.VISIBLE else View.GONE
+    private fun stopInternal() {
+        running = false
+        Config.setRunning(this, false)
+        handler.removeCallbacks(stepRunnable)
+        handler.removeCallbacks(reportRunnable)
+        db.addLog("监控停止")
+        postStatus("监控已停止")
     }
 
-    private fun setupKeywords() {
-        val input = findViewById<EditText>(R.id.et_new_keyword)
-        val recycler = findViewById<RecyclerView>(R.id.rv_keywords)
-        recycler.layoutManager = LinearLayoutManager(this)
-
-        keywordAdapter = KeywordAdapter(keywordItems) { position ->
-            if (position in keywordItems.indices) {
-                keywordItems.removeAt(position)
-                Config.setKeywords(this, keywordItems)
-                keywordAdapter.notifyDataSetChanged()
-            }
-        }
-        recycler.adapter = keywordAdapter
-        keywordItems.addAll(Config.getKeywords(this))
-        keywordAdapter.notifyDataSetChanged()
-
-        findViewById<Button>(R.id.btn_add_keyword).setOnClickListener {
-            val value = input.text.toString().trim()
-            if (value.isEmpty()) {
-                toast("请输入关键词")
-                return@setOnClickListener
-            }
-            if (keywordItems.any { it.equals(value, ignoreCase = true) }) {
-                toast("关键词已存在")
-                return@setOnClickListener
-            }
-            keywordItems.add(value)
-            Config.setKeywords(this, keywordItems)
-            keywordAdapter.notifyDataSetChanged()
-            input.text.clear()
-            toast("已添加：$value")
-        }
-
-        findViewById<EditText>(R.id.et_interval).setText(
-            Config.getInt(this, Config.KEY_INTERVAL, 5).toString()
-        )
-        findViewById<EditText>(R.id.et_max_notes).setText(
-            Config.getInt(this, Config.KEY_MAX_NOTES, 12).toString()
-        )
-        findViewById<EditText>(R.id.et_report_minutes).setText(
-            Config.getInt(this, Config.KEY_REPORT_MIN, 60).toString()
-        )
-
-        val humanCheck = findViewById<CheckBox>(R.id.cb_human_mode)
-        humanCheck.isChecked = Config.isHumanMode(this)
-        humanCheck.setOnCheckedChangeListener { _, checked ->
-            Config.setHumanMode(this, checked)
-            LocalBroadcastManager.getInstance(this)
-                .sendBroadcast(Intent(MonitorService.ACTION_RELOAD))
-            toast(if (checked) "已开启类人化节奏" else "已关闭类人化节奏，操作会变快")
-        }
-
-        findViewById<Button>(R.id.btn_save_settings).setOnClickListener {
-            val interval = findViewById<EditText>(R.id.et_interval)
-                .text.toString().toIntOrNull() ?: 5
-            val maxNotes = findViewById<EditText>(R.id.et_max_notes)
-                .text.toString().toIntOrNull() ?: 12
-            val reportMinutes = findViewById<EditText>(R.id.et_report_minutes)
-                .text.toString().toIntOrNull() ?: 60
-            Config.setInt(this, Config.KEY_INTERVAL, interval.coerceIn(3, 60))
-            Config.setInt(this, Config.KEY_MAX_NOTES, maxNotes.coerceIn(1, 60))
-            Config.setInt(this, Config.KEY_REPORT_MIN, reportMinutes.coerceIn(5, 1440))
-            LocalBroadcastManager.getInstance(this)
-                .sendBroadcast(Intent(MonitorService.ACTION_RELOAD))
-            toast("设置已保存")
-        }
-
-        findViewById<Button>(R.id.btn_permission).setOnClickListener {
-            if (isAccessibilityEnabled()) {
-                toast("无障碍权限已开启")
-            } else {
-                openAccessibilitySettings()
-            }
-        }
-
-        findViewById<Button>(R.id.btn_start_stop).setOnClickListener {
-            if (!isAccessibilityEnabled()) {
-                openAccessibilitySettings()
-                return@setOnClickListener
-            }
-            val wasRunning = Config.isRunning(this)
-            if (!wasRunning && keywordItems.isEmpty()) {
-                toast("请先添加至少一个关键词")
-                return@setOnClickListener
-            }
-            Config.setRunning(this, !wasRunning)
-            val action = if (wasRunning) MonitorService.ACTION_STOP else MonitorService.ACTION_START
-            LocalBroadcastManager.getInstance(this).sendBroadcast(Intent(action))
-            refreshStatus()
-        }
-
-        findViewById<Button>(R.id.btn_dump).setOnClickListener {
-            if (!isAccessibilityEnabled()) {
-                openAccessibilitySettings()
-                return@setOnClickListener
-            }
-            AlertDialog.Builder(this)
-                .setTitle("界面诊断")
-                .setMessage(
-                    "点「开始」后，请立刻切到小红书，停在搜索结果页或笔记详情页。" +
-                            "5 秒后会自动抓取当前界面的文字和控件标识，用来排查识别不准的问题。"
-                )
-                .setPositiveButton("开始") { _, _ ->
-                    dumpHandler.postDelayed({
-                        LocalBroadcastManager.getInstance(this)
-                            .sendBroadcast(Intent(MonitorService.ACTION_DUMP))
-                        toast("诊断完成，结果已弹出")
-                    }, 5000L)
-                }
-                .setNegativeButton("取消", null)
-                .show()
-        }
+    /** 带类人化抖动的调度；关闭拟真模式时退回简单抖动 */
+    private fun schedule(delay: Number) {
+        handler.removeCallbacks(stepRunnable)
+        val base = delay.toLong()
+        val actual = if (humanMode) HumanBehavior.actionDelay(base) else simpleJitter(base)
+        handler.postDelayed(stepRunnable, actual)
     }
 
-    private fun setupComments() {
-        val recycler = findViewById<RecyclerView>(R.id.rv_comments)
-        recycler.layoutManager = LinearLayoutManager(this)
-        commentAdapter = CommentAdapter(commentItems)
-        recycler.adapter = commentAdapter
-
-        findViewById<Button>(R.id.btn_clear_comments).setOnClickListener {
-            db.clearComments()
-            loadComments()
-            toast("本地记录已清空")
-        }
+    /** 不带抖动的调度，仅用于休息期的分段轮询 */
+    private fun scheduleRaw(delayMs: Long) {
+        handler.removeCallbacks(stepRunnable)
+        handler.postDelayed(stepRunnable, delayMs.coerceAtLeast(200L))
     }
 
-    private fun setupReports() {
-        findViewById<Button>(R.id.btn_generate_report).setOnClickListener {
-            val path = ReportGenerator.generate(this, 0L)
-            if (path == null) toast("报告生成失败，请检查存储权限") else {
-                refreshReports()
-                toast("报告已保存到 Downloads/XhsMonitor")
-            }
+    private fun simpleJitter(base: Long): Long =
+        (base * (0.85 + Random.nextDouble() * 0.3)).toLong().coerceAtLeast(300)
+
+    private fun currentKeyword(): String? = keywords.getOrNull(keywordIndex)
+
+    private fun nextKeyword(needBack: Boolean = true) {
+        if (needBack) performGlobalAction(GLOBAL_ACTION_BACK)
+        findSearchRetryCount = 0
+        inputRetryCount = 0
+        keywordIndex++
+        notesThisRound = 0
+        scrollEmptyCount = 0
+        visited.clear()
+        if (keywordIndex >= keywords.size) {
+            keywordIndex = 0
+            postStatus("一轮完成，回到第一个关键词")
         }
-
-        findViewById<Button>(R.id.btn_share_report).setOnClickListener {
-            val latest = ReportGenerator.listReports(this).firstOrNull()
-            if (latest == null) {
-                toast("暂无可分享的报告")
-                return@setOnClickListener
-            }
-            val uri = ReportGenerator.uriFor(this, latest)
-            if (uri == null) {
-                toast("分享失败")
-                return@setOnClickListener
-            }
-            val share = Intent(Intent.ACTION_SEND).apply {
-                type = "text/*"
-                putExtra(Intent.EXTRA_STREAM, uri)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            }
-            startActivity(Intent.createChooser(share, "分享监控报告"))
-        }
-    }
-
-    private fun refreshStatus() {
-        val enabled = isAccessibilityEnabled()
-        val running = Config.isRunning(this)
-        statusText.text = "状态：" + when {
-            !enabled -> "无障碍权限未开启"
-            running -> "监控运行中"
-            else -> "已就绪，未启动"
-        }
-        findViewById<Button>(R.id.btn_start_stop).text =
-            if (running) "停止监控" else "启动监控"
-    }
-
-    private fun loadComments() {
-        val list = db.getAllComments(300)
-        commentAdapter.submit(list)
-        findViewById<TextView>(R.id.tv_comments_count).text =
-            "已记录 ${list.size} 条评论"
-    }
-
-    private fun refreshReports() {
-        val reports = ReportGenerator.listReports(this)
-        val tv = findViewById<TextView>(R.id.tv_reports)
-        if (reports.isEmpty()) {
-            tv.text = "暂无汇总报告\n\n报告会按你设置的间隔自动生成到 Downloads/XhsMonitor 目录。"
+        state = if (rootInActiveWindow?.packageName?.toString() == XHS_PACKAGE) {
+            State.FIND_SEARCH
         } else {
-            tv.text = buildString {
-                append("共 ${reports.size} 份报告：\n\n")
-                reports.take(30).forEachIndexed { index, file ->
-                    append(index + 1).append(". ").append(file.name).append("\n")
+            State.LAUNCH
+        }
+        schedule(1600)
+    }
+
+    // ---------------- 状态机 ----------------
+
+    private fun step() {
+        // 会话节奏：连续运行一段时间后休息 1~3 分钟，避免长时间不间断的高频操作
+        if (humanMode) {
+            val now = System.currentTimeMillis()
+            if (resting) {
+                if (now < restUntil) {
+                    scheduleRaw((restUntil - now).coerceAtMost(60_000L))
+                    return
+                }
+                resting = false
+                restUntil = 0L
+                nextBreakAt = now + HumanBehavior.breakAfterMs()
+                postStatus("休息结束，继续监控")
+            } else if (now >= nextBreakAt) {
+                resting = true
+                restUntil = now + HumanBehavior.sessionBreakMs()
+                db.addLog("进入类人休息，约 ${(restUntil - now) / 60_000L} 分钟")
+                postStatus("休息中，稍后自动继续")
+                scheduleRaw((restUntil - now).coerceAtMost(60_000L))
+                return
+            }
+        }
+
+        val root = rootInActiveWindow
+        if (root == null) {
+            schedule(1200)
+            return
+        }
+        when (state) {
+            State.LAUNCH -> {
+                val launchIntent = packageManager.getLaunchIntentForPackage(XHS_PACKAGE)
+                if (launchIntent == null) {
+                    postStatus("未安装小红书，无法启动")
+                    stopInternal()
+                    return
+                }
+                launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                startActivity(launchIntent)
+                state = State.FIND_SEARCH
+                schedule(3200)
+            }
+
+            State.FIND_SEARCH -> {
+                if (root.packageName?.toString() != XHS_PACKAGE) {
+                    findSearchRetryCount++
+                    if (findSearchRetryCount >= 6) {
+                        findSearchRetryCount = 0
+                        postStatus("小红书未在前台，尝试重新启动")
+                        state = State.LAUNCH
+                        schedule(600)
+                    } else {
+                        schedule(1500)
+                    }
+                    return
+                }
+                val byId = findFirst(root, emptyList(), selectors.searchEntryIds, clickableOnly = true)
+                val entry = byId ?: findFirst(root, selectors.searchEntryTexts, emptyList(), clickableOnly = true)
+                val clicked = when {
+                    entry == null -> false
+                    humanMode -> tapNodeHuman(entry) || entry.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    else -> entry.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                }
+                if (clicked) {
+                    findSearchRetryCount = 0
+                    state = State.INPUT_KEYWORD
+                    schedule(if (humanMode) 900 else 1200)
+                } else {
+                    findSearchRetryCount++
+                    if (findSearchRetryCount >= 8) {
+                        findSearchRetryCount = 0
+                        postStatus("搜索入口识别失败，请导出界面诊断")
+                        state = State.LAUNCH
+                        schedule(600)
+                    } else {
+                        schedule(2500)
+                    }
+                }
+            }
+
+            State.INPUT_KEYWORD -> {
+                val keyword = currentKeyword()
+                if (keyword.isNullOrBlank()) {
+                    nextKeyword()
+                    return
+                }
+                val input = findEditable(root)
+                if (input != null) {
+                    if (humanMode) {
+                        // 按词组分段输入，模拟中文输入法的选词上屏节奏
+                        typingSteps = HumanBehavior.typingSteps(keyword)
+                        typingIndex = 0
+                        typingRetryCount = 0
+                        if (typingSteps.isEmpty()) {
+                            setInputText(input, keyword)
+                            state = State.SUBMIT_SEARCH
+                            schedule(500)
+                        } else {
+                            state = State.TYPING_KEYWORD
+                            schedule(typingSteps.first().waitBeforeMs)
+                        }
+                    } else {
+                        if (!setInputText(input, keyword)) {
+                            inputRetryCount++
+                            if (inputRetryCount >= 6) {
+                                inputRetryCount = 0
+                                nextKeyword()
+                            } else {
+                                schedule(800)
+                            }
+                            return
+                        }
+                        inputRetryCount = 0
+                        postStatus("正在搜索：$keyword")
+                        state = State.SUBMIT_SEARCH
+                        schedule(900)
+                    }
+                } else {
+                    inputRetryCount++
+                    if (inputRetryCount >= 10) {
+                        inputRetryCount = 0
+                        postStatus("搜索框长时间未出现，跳过该关键词")
+                        nextKeyword()
+                    } else {
+                        schedule(1200)
+                    }
+                }
+            }
+
+            State.TYPING_KEYWORD -> {
+                val input = findEditable(root)
+                if (input == null) {
+                    typingRetryCount++
+                    if (typingRetryCount >= 10) {
+                        typingRetryCount = 0
+                        postStatus("输入框长时间不可用，跳过该关键词")
+                        nextKeyword()
+                    } else {
+                        schedule(800)
+                    }
+                    return
+                }
+                if (typingIndex >= typingSteps.size) {
+                    state = State.SUBMIT_SEARCH
+                    schedule(500)
+                    return
+                }
+                val step = typingSteps[typingIndex]
+                if (!setInputText(input, step.text)) {
+                    typingRetryCount++
+                    if (typingRetryCount >= 6) {
+                        typingRetryCount = 0
+                        postStatus("文字输入失败，跳过该关键词")
+                        nextKeyword()
+                    } else {
+                        schedule(700)
+                    }
+                    return
+                }
+                typingRetryCount = 0
+                typingIndex++
+                if (typingIndex < typingSteps.size) {
+                    schedule(typingSteps[typingIndex].waitBeforeMs)
+                } else {
+                    postStatus("正在搜索：${currentKeyword() ?: ""}")
+                    state = State.SUBMIT_SEARCH
+                    schedule(500)
+                }
+            }
+
+            State.SUBMIT_SEARCH -> {
+                val button = findFirst(root, selectors.searchButtonTexts, emptyList(), clickableOnly = true)
+                if (button != null) {
+                    val clicked = if (humanMode) tapNodeHuman(button) else false
+                    if (!clicked) button.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                } else {
+                    if (!tapAt(0.82f, 0.10f)) tapAt(0.50f, 0.08f)
+                }
+                notesThisRound = 0
+                scrollEmptyCount = 0
+                visited.clear()
+                state = State.COLLECT_NOTES
+                schedule(2300)
+            }
+
+            State.COLLECT_NOTES -> {
+                val cameFromNote = justReturnedFromNote
+                justReturnedFromNote = false
+                val keyword = currentKeyword()
+                if (keyword.isNullOrBlank() || notesThisRound >= maxNotes) {
+                    nextKeyword(!cameFromNote)
+                    return
+                }
+                val cards = collectNoteCards(root, keyword)
+                val fresh = cards.firstOrNull { !visited.contains(it.key) }
+                if (fresh != null) {
+                    visited.add(fresh.key)
+                    // 真人不会点开每一条搜索结果
+                    if (humanMode && HumanBehavior.shouldSkipNote()) {
+                        schedule(700)
+                        return
+                    }
+                    val clicked = if (humanMode) {
+                        tapNodeHuman(fresh.node) ||
+                                fresh.node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    } else {
+                        fresh.node.performAction(AccessibilityNodeInfo.ACTION_CLICK) ||
+                                tapNode(fresh.node)
+                    }
+                    if (!clicked) {
+                        schedule(900)
+                        return
+                    }
+                    notesThisRound++
+                    currentNoteTitle = fresh.title
+                    commentScrollCount = 0
+                    targetCommentScrolls = if (humanMode) HumanBehavior.commentScrollRounds() else 2
+                    state = State.READ_COMMENTS
+                    // 先停留「看正文」，再去读评论
+                    schedule(if (humanMode) HumanBehavior.readingPauseMs() else 1800)
+                } else {
+                    val scrolled = scrollForward(root)
+                    scrollEmptyCount = if (scrolled) 0 else scrollEmptyCount + 1
+                    if (scrollEmptyCount >= 3) {
+                        nextKeyword(!cameFromNote)
+                    } else {
+                        schedule(1300)
+                    }
+                }
+            }
+
+            State.READ_COMMENTS -> {
+                val keyword = currentKeyword() ?: ""
+                val area = findCommentArea(root)
+                val records = extractComments(area, keyword, currentNoteTitle)
+                var added = 0
+                for (record in records) {
+                    if (db.insertComment(record)) added++
+                }
+                if (added > 0) {
+                    postStatus("发现 $added 条新评论")
+                    db.addLog("发现 $added 条新评论：$keyword / $currentNoteTitle")
+                    LocalBroadcastManager.getInstance(this)
+                        .sendBroadcast(Intent(BROADCAST_NEW_COMMENT).putExtra("count", added))
+                }
+                if (humanMode && HumanBehavior.shouldBackScroll()) {
+                    swipeDownSmallGesture()
+                    schedule(HumanBehavior.actionDelay(900))
+                    return
+                }
+                if (commentScrollCount < targetCommentScrolls && scrollForward(area)) {
+                    commentScrollCount++
+                    schedule(if (humanMode) HumanBehavior.actionDelay(1200) else 1200)
+                } else {
+                    performGlobalAction(GLOBAL_ACTION_BACK)
+                    justReturnedFromNote = true
+                    state = State.COLLECT_NOTES
+                    schedule(if (humanMode) HumanBehavior.actionDelay(1100) else 1300)
                 }
             }
         }
     }
 
-    private fun showDumpDialog(dump: String, path: String) {
-        val scroll = ScrollView(this)
-        val textView = TextView(this)
-        textView.text = if (dump.isBlank()) "没有抓到内容。" else dump
-        textView.textSize = 11f
-        scroll.addView(textView)
+    // ---------------- 节点查找 ----------------
 
-        AlertDialog.Builder(this)
-            .setTitle("界面结构诊断")
-            .setView(scroll)
-            .setNeutralButton("复制内容") { _, _ ->
-                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                clipboard.setPrimaryClip(ClipData.newPlainText("xhs_dump", dump))
-                toast("已复制到剪贴板")
-            }
-            .setPositiveButton("关闭", null)
-            .show()
+    /** Java 侧是 getBoundsInScreen(Rect)，带参数，Kotlin 不会合成 boundsInScreen 属性 */
+    private fun nodeBounds(node: AccessibilityNodeInfo): Rect? {
+        val rect = Rect()
+        node.getBoundsInScreen(rect)
+        return if (rect.isEmpty()) null else rect
+    }
 
-        if (path.isNotBlank()) {
-            db.addLog("导出界面诊断：$path")
+    private fun traverse(
+        node: AccessibilityNodeInfo,
+        depth: Int = 0,
+        action: (AccessibilityNodeInfo) -> Unit
+    ) {
+        if (depth > 25) return
+        action(node)
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            traverse(child, depth + 1, action)
         }
+    }
+
+    private fun containsIgnoreCase(value: CharSequence?, part: String): Boolean {
+        if (value == null || part.isBlank()) return false
+        return value.toString().contains(part, ignoreCase = true)
+    }
+
+    private fun matchesId(node: AccessibilityNodeInfo, ids: List<String>): Boolean {
+        val id = node.viewIdResourceName ?: return false
+        return ids.any { id.contains(it, ignoreCase = true) }
+    }
+
+    private fun findFirst(
+        root: AccessibilityNodeInfo,
+        texts: List<String>,
+        ids: List<String>,
+        clickableOnly: Boolean = false,
+        minChildren: Int = 0
+    ): AccessibilityNodeInfo? {
+        var found: AccessibilityNodeInfo? = null
+        traverse(root) { node ->
+            if (found == null) {
+                val textHit = texts.any {
+                    containsIgnoreCase(node.text, it) || containsIgnoreCase(node.contentDescription, it)
+                }
+                val idHit = matchesId(node, ids)
+                if ((textHit || idHit) &&
+                    (!clickableOnly || node.isClickable) &&
+                    node.childCount >= minChildren
+                ) {
+                    found = node
+                }
+            }
+        }
+        return found
+    }
+
+    private fun findEditable(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        var found: AccessibilityNodeInfo? = null
+        traverse(root) { node ->
+            if (found == null) {
+                val cls = node.className?.toString() ?: ""
+                val isEdit = cls.contains("EditText", ignoreCase = true) || node.isEditable
+                if (isEdit && (cls.contains("EditText", ignoreCase = true) ||
+                            matchesId(node, selectors.searchInputIds))
+                ) {
+                    found = node
+                }
+            }
+        }
+        return found
+    }
+
+    private fun setInputText(input: AccessibilityNodeInfo, text: String): Boolean {
+        val args = Bundle().apply {
+            putCharSequence(
+                AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                text
+            )
+        }
+        if (input.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return true
+        // 焦点不在输入框时先聚焦再重试一次
+        input.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        return input.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+    }
+
+    private fun collectNoteCards(root: AccessibilityNodeInfo, keyword: String): List<Card> {
+        val result = mutableListOf<Card>()
+        traverse(root) { node ->
+            if (!node.isClickable) return@traverse
+            val rect: Rect = nodeBounds(node) ?: return@traverse
+            if (rect.width() < 200 || rect.height() < 60) return@traverse
+
+            val visible = (node.text?.toString() ?: node.contentDescription?.toString() ?: "").trim()
+            val idHit = matchesId(node, selectors.noteCardIds)
+            val textHit = visible.length >= keyword.length + 2 &&
+                    visible.contains(keyword, ignoreCase = true)
+            if (idHit || textHit) {
+                val title = if (visible.isNotBlank()) visible.take(60) else findTitleIn(node)
+                result.add(Card(node, "${visible.take(40)}|${rect.left},${rect.top}", title))
+            }
+        }
+        return result.distinctBy { it.key }
+    }
+
+    private fun findTitleIn(node: AccessibilityNodeInfo): String {
+        var title = ""
+        traverse(node, 0) { n ->
+            if (title.isEmpty() && matchesId(n, selectors.titleIds)) {
+                val t = n.text?.toString()?.trim().orEmpty()
+                if (t.length > 2) title = t.take(60)
+            }
+        }
+        return title.ifEmpty { "未命名笔记" }
+    }
+
+    private fun findCommentArea(root: AccessibilityNodeInfo): AccessibilityNodeInfo {
+        val byId = findFirst(root, emptyList(), selectors.commentAreaIds, minChildren = 2)
+        if (byId != null) return byId
+        var found: AccessibilityNodeInfo? = null
+        traverse(root) { node ->
+            if (found == null && node.isScrollable && node.childCount >= 2) {
+                val t = node.text?.toString().orEmpty()
+                if (t.contains("评论") || t.contains("条评论")) found = node
+            }
+        }
+        return found ?: root
+    }
+
+    // ---------------- 评论解析 ----------------
+
+    private val timeHintRegex = Regex(
+        "刚刚|分钟前|小时前|天前|昨天|前天|星期[一二三四五六日]|周[一二三四五六日]|" +
+                "\\d{1,2}-\\d{1,2}|\\d{4}-\\d{1,2}-\\d{1,2}"
+    )
+
+    private val noiseWords = listOf(
+        "关注", "点赞", "收藏", "分享", "评论", "回复", "发送", "说点什么", "展开更多",
+        "全部", "热度", "最新", "搜索", "返回", "小红书", "登录", "举报", "更多",
+        "拿铁", "赞", "收藏了", "已关注"
+    )
+
+    private fun looksLikeTime(s: String): Boolean = timeHintRegex.containsMatchIn(s)
+
+    private fun isNoise(s: String): Boolean {
+        if (s.isBlank()) return true
+        if (noiseWords.any { s == it }) return true
+        return s.length <= 2 && s.all { it.isDigit() }
+    }
+
+    private fun leafTexts(node: AccessibilityNodeInfo): List<String> {
+        val out = mutableListOf<String>()
+
+        fun walk(n: AccessibilityNodeInfo, depth: Int) {
+            if (depth > 12) return
+            val t = n.text?.toString()?.trim().orEmpty()
+            if (t.isNotEmpty()) out.add(t)
+            for (i in 0 until n.childCount) {
+                val child = n.getChild(i) ?: continue
+                walk(child, depth + 1)
+            }
+        }
+
+        walk(node, 0)
+        return out
+    }
+
+    private fun extractComments(
+        area: AccessibilityNodeInfo,
+        keyword: String,
+        noteTitle: String
+    ): List<CommentRecord> {
+        val now = System.currentTimeMillis()
+        val result = mutableListOf<CommentRecord>()
+        val itemNodes = mutableListOf<AccessibilityNodeInfo>()
+
+        traverse(area) { node ->
+            if (node.childCount > 0 && matchesId(node, selectors.commentItemIds)) {
+                itemNodes.add(node)
+            }
+        }
+
+        if (itemNodes.isNotEmpty()) {
+            for (item in itemNodes.take(30)) {
+                val texts = leafTexts(item).filter { !isNoise(it) }
+                if (texts.isEmpty()) continue
+                val author = texts[0].take(40)
+                val time = texts.firstOrNull { looksLikeTime(it) } ?: ""
+                val content = texts.drop(1)
+                    .filter { it != time && !looksLikeTime(it) }
+                    .joinToString(" ")
+                    .take(500)
+                if (content.isBlank()) continue
+                result.add(
+                    CommentRecord(
+                        CommentRecord.makeId(keyword, noteTitle, author, content),
+                        keyword, noteTitle, author, content, time, now
+                    )
+                )
+            }
+            return result
+        }
+
+        // 兜底：没有 comment_item 标识时，要求区域内至少出现时间文案，避免把正文当评论
+        val allTexts = leafTexts(area)
+        if (!allTexts.any { looksLikeTime(it) }) return emptyList()
+
+        val texts = allTexts.filter { it.length >= 2 && !isNoise(it) }.takeLast(40)
+        var i = 0
+        while (i + 1 < texts.size) {
+            val author = texts[i].take(40)
+            val content = texts[i + 1].take(500)
+            val time = if (i + 2 < texts.size && looksLikeTime(texts[i + 2])) texts[i + 2] else ""
+            i += if (time.isNotEmpty()) 3 else 2
+            if (isNoise(author) || isNoise(content)) continue
+            result.add(
+                CommentRecord(
+                    CommentRecord.makeId(keyword, noteTitle, author, content),
+                    keyword, noteTitle, author, content, time, now
+                )
+            )
+        }
+        return result
+    }
+
+    // ---------------- 滚动与手势 ----------------
+
+    private fun scrollForward(node: AccessibilityNodeInfo): Boolean {
+        // 拟真模式下优先用真实注入手势，轨迹和速度每次都不同
+        if (humanMode && Random.nextDouble() < 0.55 && swipeUpGesture()) return true
+
+        var done = false
+        var current: AccessibilityNodeInfo? = node
+        while (current != null && !done) {
+            if (current.isScrollable &&
+                current.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)
+            ) {
+                done = true
+            }
+            current = current.parent
+        }
+        if (!done) {
+            traverse(node) { n ->
+                if (!done && n.isScrollable &&
+                    n.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)
+                ) done = true
+            }
+        }
+        if (!done) done = swipeUpGesture()
+        return done
+    }
+
+    private fun swipeUpGesture(): Boolean {
+        val metrics = resources.displayMetrics
+        val swipe = HumanBehavior.swipeUp(metrics.widthPixels, metrics.heightPixels)
+        return dispatchGesture(
+            GestureDescription.Builder()
+                .addStroke(GestureDescription.StrokeDescription(swipe.path, 0L, swipe.durationMs))
+                .build(),
+            null, null
+        )
+    }
+
+    private fun swipeDownSmallGesture(): Boolean {
+        val metrics = resources.displayMetrics
+        val swipe = HumanBehavior.swipeDownSmall(metrics.widthPixels, metrics.heightPixels)
+        return dispatchGesture(
+            GestureDescription.Builder()
+                .addStroke(GestureDescription.StrokeDescription(swipe.path, 0L, swipe.durationMs))
+                .build(),
+            null, null
+        )
+    }
+
+    private fun tapNode(node: AccessibilityNodeInfo): Boolean {
+        val rect = nodeBounds(node) ?: return false
+        return tapPoint((rect.left + rect.right) / 2f, (rect.top + rect.bottom) / 2f)
+    }
+
+    /** 拟真点击：触点在控件范围内随机偏移，按压时长也有波动 */
+    private fun tapNodeHuman(node: AccessibilityNodeInfo): Boolean {
+        val rect = nodeBounds(node) ?: return false
+        val tap = HumanBehavior.tap(rect)
+        return tapPoint(tap.x, tap.y, tap.durationMs)
+    }
+
+    private fun tapAt(xRatio: Float, yRatio: Float): Boolean {
+        val metrics = resources.displayMetrics
+        return tapPoint(metrics.widthPixels * xRatio, metrics.heightPixels * yRatio)
+    }
+
+    private fun tapPoint(x: Float, y: Float, durationMs: Long = 60L): Boolean {
+        val path = Path().apply {
+            moveTo(x, y)
+            lineTo(x + 1f, y + 1f)
+        }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0L, durationMs))
+            .build()
+        return dispatchGesture(gesture, null, null)
+    }
+
+    // ---------------- 诊断与报告 ----------------
+
+    private fun dumpCurrentScreen() {
+        val root = rootInActiveWindow
+        val sb = StringBuilder()
+        val counter = intArrayOf(0)
+        if (root == null) {
+            sb.append("当前拿不到窗口节点。请先切到小红书界面，再回到本 App 点诊断。\n")
+        } else {
+            dumpNode(root, 0, sb, counter)
+        }
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
+        val path = ReportGenerator.saveText(this, "界面诊断_$stamp.txt", sb.toString())
+        val intent = Intent(BROADCAST_DUMP).apply {
+            putExtra("dump", sb.toString())
+            putExtra("path", path ?: "")
+        }
+        LocalBroadcastManager.getInstance(this).sendBroadcast(intent)
+    }
+
+    private fun dumpNode(
+        node: AccessibilityNodeInfo,
+        depth: Int,
+        sb: StringBuilder,
+        counter: IntArray
+    ) {
+        if (counter[0] > 400 || depth > 18) return
+        counter[0]++
+        val text = node.text?.toString()?.replace("\n", " ")?.take(70) ?: ""
+        val desc = node.contentDescription?.toString()?.take(50) ?: ""
+        sb.append("  ".repeat(depth))
+            .append(node.className ?: "?")
+            .append(" id=").append(node.viewIdResourceName ?: "-")
+            .append(" click=").append(node.isClickable)
+            .append(" scroll=").append(node.isScrollable)
+            .append(" bounds=").append(nodeBounds(node)?.toShortString() ?: "-")
+            .append(" text=").append(text)
+            .append(" desc=").append(desc)
+            .append("\n")
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            dumpNode(child, depth + 1, sb, counter)
+        }
+    }
+
+    private fun generateReport() {
+        val path = ReportGenerator.generate(this, lastReportTs)
+        if (path == null) {
+            postStatus("汇总生成失败，请检查存储权限")
+            return
+        }
+        lastReportTs = System.currentTimeMillis()
+        postStatus("汇总已生成")
+        showNotification("新的评论汇总已保存到 Downloads/XhsMonitor")
+        LocalBroadcastManager.getInstance(this)
+            .sendBroadcast(Intent(BROADCAST_REPORT).putExtra("path", path))
+    }
+
+    private fun showNotification(message: String) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(
+                this, android.Manifest.permission.POST_NOTIFICATIONS
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            manager.createNotificationChannel(
+                NotificationChannel("xhs_report", "监控汇总", NotificationManager.IMPORTANCE_LOW)
+            )
+        }
+        val notification = NotificationCompat.Builder(this, "xhs_report")
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentTitle("小红书评论监控")
+            .setContentText(message.take(80))
+            .setAutoCancel(true)
+            .build()
+        manager.notify(1001, notification)
+    }
+
+    private fun postStatus(message: String) {
+        LocalBroadcastManager.getInstance(this)
+            .sendBroadcast(Intent(BROADCAST_STATUS).putExtra("msg", message))
     }
 }
