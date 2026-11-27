@@ -1,4 +1,4 @@
 <resources>
-    <string name="app_name">小红书评论监控</string>
+    <string name="app_name">小红书评论监控 v4</string>
     <string name="accessibility_description">只读监控小红书搜索结果中的笔记评论。不会发帖、不会自动评论，也不会收集隐私信息。</string>
 </resources>
