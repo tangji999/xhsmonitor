@@ -565,7 +565,7 @@ class MonitorService : AccessibilityService() {
      * 避免把顶部「发现」标签误当成搜索按钮；精确匹配不到再退回配置里的模糊规则。
      * 小红书混淆了资源名（0_resource_name_obfuscated），所以这里以文案为主。
      */
-    private fun findSearchEntry(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        private fun findSearchEntry(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
         var exact: AccessibilityNodeInfo? = null
         var corner: AccessibilityNodeInfo? = null
         val metrics = resources.displayMetrics
@@ -594,6 +594,7 @@ class MonitorService : AccessibilityService() {
         val byId = findFirst(root, emptyList(), selectors.searchEntryIds, clickableOnly = true)
         return byId ?: findFirst(root, selectors.searchEntryTexts, emptyList(), clickableOnly = true)
     }
+
 
     private fun findEditable(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
         var found: AccessibilityNodeInfo? = null
