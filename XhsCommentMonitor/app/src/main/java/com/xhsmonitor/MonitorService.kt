@@ -297,8 +297,7 @@ class MonitorService : AccessibilityService() {
                     }
                     return
                 }
-                val byId = findFirst(root, emptyList(), selectors.searchEntryIds, clickableOnly = true)
-                val entry = byId ?: findFirst(root, selectors.searchEntryTexts, emptyList(), clickableOnly = true)
+                val entry = findSearchEntry(root)
                 val clicked = when {
                     entry == null -> false
                     humanMode -> tapNodeHuman(entry) || entry.performAction(AccessibilityNodeInfo.ACTION_CLICK)
@@ -506,6 +505,13 @@ class MonitorService : AccessibilityService() {
 
     // ---------------- 节点查找 ----------------
 
+    /** Java 侧是 getBoundsInScreen(Rect)，带参数，Kotlin 不会合成 boundsInScreen 属性 */
+    private fun nodeBounds(node: AccessibilityNodeInfo): Rect? {
+        val rect = Rect()
+        node.getBoundsInScreen(rect)
+        return if (rect.isEmpty()) null else rect
+    }
+
     private fun traverse(
         node: AccessibilityNodeInfo,
         depth: Int = 0,
@@ -554,6 +560,41 @@ class MonitorService : AccessibilityService() {
         return found
     }
 
+    /**
+     * 首页搜索入口：先精确匹配 contentDescription/text 为「搜索」的可点击控件，
+     * 避免把顶部「发现」标签误当成搜索按钮；精确匹配不到再退回配置里的模糊规则。
+     * 小红书混淆了资源名（0_resource_name_obfuscated），所以这里以文案为主。
+     */
+    private fun findSearchEntry(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        var exact: AccessibilityNodeInfo? = null
+        var corner: AccessibilityNodeInfo? = null
+        val metrics = resources.displayMetrics
+        val minX = metrics.widthPixels * 0.82f
+        val maxY = metrics.heightPixels * 0.11f
+        val tabWords = setOf("关注", "发现", "上海", "菜单", "消息", "我", "首页", "市集", "发布")
+        traverse(root) { node ->
+            if (!node.isClickable) return@traverse
+            val text = node.text?.toString()?.trim().orEmpty()
+            val desc = node.contentDescription?.toString()?.trim().orEmpty()
+            if (exact == null && (text == "搜索" || desc == "搜索" ||
+                        text.equals("Search", ignoreCase = true) ||
+                        desc.equals("Search", ignoreCase = true))
+            ) {
+                exact = node
+            }
+            if (corner == null) {
+                val r = nodeBounds(node)
+                if (r != null && r.left >= minX && r.top <= maxY &&
+                    text !in tabWords && desc !in tabWords
+                ) corner = node
+            }
+        }
+        if (exact != null) return exact
+        if (corner != null) return corner
+        val byId = findFirst(root, emptyList(), selectors.searchEntryIds, clickableOnly = true)
+        return byId ?: findFirst(root, selectors.searchEntryTexts, emptyList(), clickableOnly = true)
+    }
+
     private fun findEditable(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
         var found: AccessibilityNodeInfo? = null
         traverse(root) { node ->
@@ -587,7 +628,7 @@ class MonitorService : AccessibilityService() {
         val result = mutableListOf<Card>()
         traverse(root) { node ->
             if (!node.isClickable) return@traverse
-            val rect: Rect = node.boundsInScreen ?: return@traverse
+            val rect: Rect = nodeBounds(node) ?: return@traverse
             if (rect.width() < 200 || rect.height() < 60) return@traverse
 
             val visible = (node.text?.toString() ?: node.contentDescription?.toString() ?: "").trim()
@@ -772,13 +813,13 @@ class MonitorService : AccessibilityService() {
     }
 
     private fun tapNode(node: AccessibilityNodeInfo): Boolean {
-        val rect = node.boundsInScreen ?: return false
+        val rect = nodeBounds(node) ?: return false
         return tapPoint((rect.left + rect.right) / 2f, (rect.top + rect.bottom) / 2f)
     }
 
     /** 拟真点击：触点在控件范围内随机偏移，按压时长也有波动 */
     private fun tapNodeHuman(node: AccessibilityNodeInfo): Boolean {
-        val rect = node.boundsInScreen ?: return false
+        val rect = nodeBounds(node) ?: return false
         val tap = HumanBehavior.tap(rect)
         return tapPoint(tap.x, tap.y, tap.durationMs)
     }
@@ -834,7 +875,7 @@ class MonitorService : AccessibilityService() {
             .append(" id=").append(node.viewIdResourceName ?: "-")
             .append(" click=").append(node.isClickable)
             .append(" scroll=").append(node.isScrollable)
-            .append(" bounds=").append(node.boundsInScreen?.toShortString() ?: "-")
+            .append(" bounds=").append(nodeBounds(node)?.toShortString() ?: "-")
             .append(" text=").append(text)
             .append(" desc=").append(desc)
             .append("\n")
