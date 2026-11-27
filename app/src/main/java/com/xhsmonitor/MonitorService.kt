@@ -506,6 +506,13 @@ class MonitorService : AccessibilityService() {
 
     // ---------------- 节点查找 ----------------
 
+    /** Java 侧是 getBoundsInScreen(Rect)，带参数，Kotlin 不会合成 boundsInScreen 属性 */
+    private fun nodeBounds(node: AccessibilityNodeInfo): Rect? {
+        val rect = Rect()
+        node.getBoundsInScreen(rect)
+        return if (rect.isEmpty()) null else rect
+    }
+
     private fun traverse(
         node: AccessibilityNodeInfo,
         depth: Int = 0,
@@ -587,7 +594,7 @@ class MonitorService : AccessibilityService() {
         val result = mutableListOf<Card>()
         traverse(root) { node ->
             if (!node.isClickable) return@traverse
-            val rect: Rect = node.boundsInScreen ?: return@traverse
+            val rect: Rect = nodeBounds(node) ?: return@traverse
             if (rect.width() < 200 || rect.height() < 60) return@traverse
 
             val visible = (node.text?.toString() ?: node.contentDescription?.toString() ?: "").trim()
@@ -772,13 +779,13 @@ class MonitorService : AccessibilityService() {
     }
 
     private fun tapNode(node: AccessibilityNodeInfo): Boolean {
-        val rect = node.boundsInScreen ?: return false
+        val rect = nodeBounds(node) ?: return false
         return tapPoint((rect.left + rect.right) / 2f, (rect.top + rect.bottom) / 2f)
     }
 
     /** 拟真点击：触点在控件范围内随机偏移，按压时长也有波动 */
     private fun tapNodeHuman(node: AccessibilityNodeInfo): Boolean {
-        val rect = node.boundsInScreen ?: return false
+        val rect = nodeBounds(node) ?: return false
         val tap = HumanBehavior.tap(rect)
         return tapPoint(tap.x, tap.y, tap.durationMs)
     }
@@ -834,7 +841,7 @@ class MonitorService : AccessibilityService() {
             .append(" id=").append(node.viewIdResourceName ?: "-")
             .append(" click=").append(node.isClickable)
             .append(" scroll=").append(node.isScrollable)
-            .append(" bounds=").append(node.boundsInScreen?.toShortString() ?: "-")
+            .append(" bounds=").append(nodeBounds(node)?.toShortString() ?: "-")
             .append(" text=").append(text)
             .append(" desc=").append(desc)
             .append("\n")
