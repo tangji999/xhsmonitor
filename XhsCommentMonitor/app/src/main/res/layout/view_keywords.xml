@@ -1,0 +1,125 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="12dp">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="监控关键词"
+            android:textColor="@color/black"
+            android:textSize="16sp"
+            android:textStyle="bold" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <EditText
+                android:id="@+id/et_new_keyword"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:hint="输入关键词，如：国内水硕"
+                android:inputType="text"
+                android:maxLines="1" />
+
+            <Button
+                android:id="@+id/btn_add_keyword"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="添加" />
+        </LinearLayout>
+
+        <androidx.recyclerview.widget.RecyclerView
+            android:id="@+id/rv_keywords"
+            android:layout_width="match_parent"
+            android:layout_height="140dp"
+            android:nestedScrollingEnabled="false" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="运行参数"
+            android:textColor="@color/black"
+            android:textSize="16sp"
+            android:textStyle="bold" />
+
+        <EditText
+            android:id="@+id/et_interval"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="每次操作间隔秒数（默认 5）"
+            android:inputType="number"
+            android:maxLines="1" />
+
+        <EditText
+            android:id="@+id/et_max_notes"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="每轮最多看多少篇笔记（默认 12）"
+            android:inputType="number"
+            android:maxLines="1" />
+
+        <EditText
+            android:id="@+id/et_report_minutes"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="汇总间隔分钟（默认 60）"
+            android:inputType="number"
+            android:maxLines="1" />
+
+        <CheckBox
+            android:id="@+id/cb_human_mode"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:checked="true"
+            android:text="类人化节奏（更慢、更接近真人操作）"
+            android:textColor="@color/black"
+            android:textSize="14sp" />
+
+        <Button
+            android:id="@+id/btn_save_settings"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="保存设置" />
+
+        <Button
+            android:id="@+id/btn_permission"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="开启无障碍权限" />
+
+        <Button
+            android:id="@+id/btn_start_stop"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="启动监控" />
+
+        <Button
+            android:id="@+id/btn_dump"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="诊断当前界面（发我排查识别问题）" />
+
+        <TextView
+            android:id="@+id/tv_hint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:text="提示：类人化只调整操作节奏，不能保证不被平台识别。建议用备用账号，间隔不要低于 4 秒。本工具只读评论，不发帖、不评论、不私信。"
+            android:textColor="#666666"
+            android:textSize="13sp" />
+
+    </LinearLayout>
+
+</ScrollView>

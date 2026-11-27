@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="12dp">
+
+    <TextView
+        android:id="@+id/tv_reports"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:text="暂无汇总报告\n\n报告会按你设置的间隔自动生成到 Downloads/XhsMonitor 目录。"
+        android:textColor="@color/black"
+        android:textSize="14sp" />
+
+    <Button
+        android:id="@+id/btn_generate_report"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="立即生成汇总" />
+
+    <Button
+        android:id="@+id/btn_share_report"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="分享最新报告" />
+
+</LinearLayout>
